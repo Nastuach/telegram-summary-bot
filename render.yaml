@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-summary-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: FOLDER_ID
+        sync: false
+      - key: API_KEY
+        sync: false
+    disk:
+      name: database
+      mountPath: /app
+      sizeGB: 1
