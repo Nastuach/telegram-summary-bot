@@ -2,7 +2,10 @@ services:
   - type: web
     name: telegram-summary-bot
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install setuptools wheel
+      pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
@@ -11,7 +14,5 @@ services:
         sync: false
       - key: API_KEY
         sync: false
-    disk:
-      name: database
-      mountPath: /app
-      sizeGB: 1
+      - key: WHISPER_MODEL
+        value: tiny
