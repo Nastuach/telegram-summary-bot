@@ -1,13 +1,13 @@
 import asyncio
 import os
 import sys
-import sqlite3
 import logging
 import subprocess
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import requests
 import whisper
+import asyncpg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -25,9 +25,6 @@ load_dotenv()
 print("🔧 Настройка ffmpeg...")
 
 def find_ffmpeg():
-    """Автоматически находит ffmpeg на разных платформах"""
-    
-    # 1. Проверяем, есть ли ffmpeg в PATH
     try:
         result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
@@ -36,84 +33,107 @@ def find_ffmpeg():
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
     
-    # 2. Проверяем стандартные пути для Windows
     if sys.platform == 'win32':
         possible_paths = [
             r"C:\ffmpeg\bin\ffmpeg.exe",
             r"C:\ffmpeg\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe",
             r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-            r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
         ]
         for path in possible_paths:
             if os.path.exists(path):
                 print(f"✅ Найден ffmpeg: {path}")
                 return path
-    
-    # 3. Для Linux/Mac проверяем стандартные пути
     else:
-        possible_paths = [
-            '/usr/bin/ffmpeg',
-            '/usr/local/bin/ffmpeg',
-            '/opt/ffmpeg/bin/ffmpeg',
-        ]
+        possible_paths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']
         for path in possible_paths:
             if os.path.exists(path):
                 print(f"✅ Найден ffmpeg: {path}")
                 return path
     
-    print("❌ ffmpeg не найден! Будет использован системный путь.")
+    print("❌ ffmpeg не найден!")
     return 'ffmpeg'
 
-# Находим ffmpeg
 FFMPEG_PATH = find_ffmpeg()
 
-# Добавляем в PATH если это путь к файлу
 if FFMPEG_PATH != 'ffmpeg' and os.path.exists(os.path.dirname(FFMPEG_PATH)):
     ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
     os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ["PATH"]
-    
-# Настраиваем Whisper
+
 try:
     whisper.ffmpeg = FFMPEG_PATH
     print(f"✅ Whisper настроен на: {FFMPEG_PATH}")
 except:
     pass
 
-# Проверяем работу
-try:
-    result = subprocess.run([FFMPEG_PATH, '-version'], capture_output=True, text=True, timeout=5)
-    if result.returncode == 0:
-        print("✅ ffmpeg работает")
-        print(result.stdout.split('\n')[0])
-    else:
-        print("⚠️ ffmpeg не отвечает")
-except Exception as e:
-    print(f"⚠️ Ошибка проверки ffmpeg: {e}")
-
 # ---------- КОНФИГУРАЦИЯ ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FOLDER_ID = os.getenv("FOLDER_ID")
 API_KEY = os.getenv("API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Добавляем переменную для PostgreSQL
 
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN не найден в .env файле!")
     exit(1)
-if not FOLDER_ID or not API_KEY:
-    logging.warning("FOLDER_ID или API_KEY не найдены. Суммаризация не будет работать!")
+if not DATABASE_URL:
+    logging.error("DATABASE_URL не найден! Нужно подключить PostgreSQL")
+    exit(1)
 
 # ---------- ИНИЦИАЛИЗАЦИЯ ----------
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
+class Database:
+    def __init__(self):
+        self.pool = None
+    
+    async def init(self):
+        self.pool = await asyncpg.create_pool(DATABASE_URL)
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_name TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    text TEXT,
+                    time TIMESTAMP NOT NULL,
+                    type TEXT NOT NULL
+                )
+            ''')
+            await conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_id_time 
+                ON messages(chat_id, time)
+            ''')
+        logging.info("Database initialized")
+    
+    async def save_message(self, chat_id, user_name, user_id, text, msg_type):
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                INSERT INTO messages (chat_id, user_name, user_id, text, time, type)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            ''', chat_id, user_name, user_id, text, datetime.now(timezone.utc), msg_type)
+            logging.info(f"Saved message from {user_name}")
+    
+    async def get_messages(self, chat_id, hours):
+        time_limit = datetime.now(timezone.utc) - timedelta(hours=hours)
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT user_name, text 
+                FROM messages 
+                WHERE chat_id = $1 AND time >= $2 
+                ORDER BY time ASC
+            ''', chat_id, time_limit)
+            return [(row['user_name'], row['text']) for row in rows]
+
+db = Database()
+
 # ---------- WHISPER ----------
 print("🔧 Загрузка Whisper модели...")
 whisper_model = None
 try:
-    # На сервере лучше использовать модель "tiny" или "base"
-    # "tiny" - 75 MB, быстрее, чуть хуже качество
-    # "base" - 145 MB, хорошее качество
-    model_size = os.getenv("WHISPER_MODEL", "base")  # можно указать в .env
+    model_size = os.getenv("WHISPER_MODEL", "tiny")
     whisper_model = whisper.load_model(model_size)
     print(f"✅ Whisper модель '{model_size}' загружена")
 except Exception as e:
@@ -123,64 +143,7 @@ except Exception as e:
 class SummaryStates(StatesGroup):
     waiting_for_hours = State()
 
-# ---------- БАЗА ДАННЫХ ----------
-def init_db():
-    conn = sqlite3.connect('database.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        user TEXT,
-        user_id INTEGER,
-        text TEXT,
-        time TEXT,
-        type TEXT
-    )''')
-    conn.commit()
-    conn.close()
-    logging.info("Database initialized")
-
-init_db()
-
-# ---------- ФУНКЦИИ БД ----------
-async def save_message(chat_id, user, user_id, text, msg_type):
-    def sync_save():
-        try:
-            current_time = datetime.now(timezone.utc).isoformat()
-            conn = sqlite3.connect('database.db')
-            c = conn.cursor()
-            c.execute("INSERT INTO messages (chat_id, user, user_id, text, type, time) VALUES (?, ?, ?, ?, ?, ?)",
-                      (chat_id, user, user_id, text, msg_type, current_time))
-            conn.commit()
-            conn.close()
-            logging.info(f"Saved message from {user}")
-        except Exception as e:
-            logging.error(f"Error saving message: {e}")
-    
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, sync_save)
-
-async def get_messages(chat_id, hours):
-    def sync_get():
-        try:
-            time_limit = datetime.now(timezone.utc) - timedelta(hours=hours)
-            time_limit_str = time_limit.isoformat()
-            
-            conn = sqlite3.connect('database.db')
-            c = conn.cursor()
-            c.execute("SELECT user, text FROM messages WHERE chat_id = ? AND time >= ? ORDER BY time ASC",
-                      (chat_id, time_limit_str))
-            messages = c.fetchall()
-            conn.close()
-            return messages
-        except Exception as e:
-            logging.error(f"Error getting messages: {e}")
-            return []
-    
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, sync_get)
-
-# ---------- ФУНКЦИЯ ДЛЯ ИЗВЛЕЧЕНИЯ АУДИО ИЗ ВИДЕО ----------
+# ---------- ФУНКЦИЯ ДЛЯ ИЗВЛЕЧЕНИЯ АУДИО ----------
 async def extract_audio_from_video(video_path: str, audio_path: str) -> bool:
     try:
         cmd = [FFMPEG_PATH, '-i', video_path, '-vn', '-acodec', 'mp3', '-y', audio_path]
@@ -226,7 +189,6 @@ async def summarize_with_yandex(messages: list) -> str:
     else:
         note = ""
     
-    # Формируем диалог
     dialog = "\n".join([f"{user}: {text}" for user, text in messages])
     
     prompt = (
@@ -342,7 +304,7 @@ async def hours_callback(callback: types.CallbackQuery, state: FSMContext):
         return
     
     status_msg = await callback.message.answer(f"Получаю сообщения за {hours} часов...")
-    messages = await get_messages(chat_id, hours)
+    messages = await db.get_messages(chat_id, hours)
     
     if not messages:
         await status_msg.delete()
@@ -377,7 +339,7 @@ async def process_custom_hours(message: types.Message, state: FSMContext):
         return
     
     status_msg = await message.reply(f"Получаю сообщения за {hours} часов...")
-    messages = await get_messages(chat_id, hours)
+    messages = await db.get_messages(chat_id, hours)
     
     if not messages:
         await status_msg.delete()
@@ -401,7 +363,7 @@ async def handle_text(message: types.Message):
     user_name = message.from_user.username or message.from_user.full_name
     user_id = message.from_user.id
     
-    await save_message(message.chat.id, user_name, user_id, message.text, "text")
+    await db.save_message(message.chat.id, user_name, user_id, message.text, "text")
 
 @dp.message(F.voice)
 async def handle_voice(message: types.Message):
@@ -415,14 +377,14 @@ async def handle_voice(message: types.Message):
         await bot.download_file(file.file_path, file_path)
         
         text = await voice_to_text(file_path)
-        await save_message(message.chat.id, user_name, user_id, text, "voice")
+        await db.save_message(message.chat.id, user_name, user_id, text, "voice")
         
         if os.path.exists(file_path):
             os.remove(file_path)
             
     except Exception as e:
         logging.error(f"Error processing voice: {e}")
-        await save_message(message.chat.id, user_name, user_id, f"[Ошибка: {e}]", "voice_error")
+        await db.save_message(message.chat.id, user_name, user_id, f"[Ошибка: {e}]", "voice_error")
 
 @dp.message(F.video_note)
 async def handle_video_note(message: types.Message):
@@ -440,9 +402,9 @@ async def handle_video_note(message: types.Message):
         
         if success:
             text = await voice_to_text(audio_path)
-            await save_message(message.chat.id, user_name, user_id, text, "video_note")
+            await db.save_message(message.chat.id, user_name, user_id, text, "video_note")
         else:
-            await save_message(message.chat.id, user_name, user_id, "[Не удалось извлечь аудио]", "video_note_error")
+            await db.save_message(message.chat.id, user_name, user_id, "[Не удалось извлечь аудио]", "video_note_error")
         
         for path in [video_path, audio_path]:
             if os.path.exists(path):
@@ -450,7 +412,7 @@ async def handle_video_note(message: types.Message):
                 
     except Exception as e:
         logging.error(f"Error processing video note: {e}")
-        await save_message(message.chat.id, user_name, user_id, f"[Ошибка: {e}]", "video_note_error")
+        await db.save_message(message.chat.id, user_name, user_id, f"[Ошибка: {e}]", "video_note_error")
 
 @dp.message(F.video)
 async def handle_video(message: types.Message):
@@ -468,9 +430,9 @@ async def handle_video(message: types.Message):
         
         if success:
             text = await voice_to_text(audio_path)
-            await save_message(message.chat.id, user_name, user_id, text, "video")
+            await db.save_message(message.chat.id, user_name, user_id, text, "video")
         else:
-            await save_message(message.chat.id, user_name, user_id, "[Не удалось извлечь аудио]", "video_error")
+            await db.save_message(message.chat.id, user_name, user_id, "[Не удалось извлечь аудио]", "video_error")
         
         for path in [video_path, audio_path]:
             if os.path.exists(path):
@@ -478,25 +440,28 @@ async def handle_video(message: types.Message):
                 
     except Exception as e:
         logging.error(f"Error processing video: {e}")
-        await save_message(message.chat.id, user_name, user_id, f"[Ошибка: {e}]", "video_error")
+        await db.save_message(message.chat.id, user_name, user_id, f"[Ошибка: {e}]", "video_error")
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     user_name = message.from_user.username or message.from_user.full_name
     user_id = message.from_user.id
     caption = message.caption or "[Фото без подписи]"
-    await save_message(message.chat.id, user_name, user_id, f"[Фото] {caption}", "photo")
+    await db.save_message(message.chat.id, user_name, user_id, f"[Фото] {caption}", "photo")
 
 @dp.message()
 async def handle_other(message: types.Message):
     user_name = message.from_user.username or message.from_user.full_name
     user_id = message.from_user.id
-    await save_message(message.chat.id, user_name, user_id, f"[{message.content_type}]", "other")
+    await db.save_message(message.chat.id, user_name, user_id, f"[{message.content_type}]", "other")
 
 # ---------- ЗАПУСК ----------
 async def main():
     logging.info("Starting bot...")
     try:
+        # Инициализируем базу данных
+        await db.init()
+        
         await bot.delete_webhook(drop_pending_updates=True)
         await set_commands()
         
