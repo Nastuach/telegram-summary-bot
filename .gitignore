@@ -26,7 +26,3 @@ video_note_*
 .idea/
 *.swp
 *.swo
-
-# OS
-.DS_Store
-Thumbs.db

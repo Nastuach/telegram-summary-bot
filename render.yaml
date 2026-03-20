@@ -3,8 +3,8 @@ services:
     name: telegram-summary-bot
     runtime: python
     buildCommand: |
-      pip install --upgrade pip
-      pip install setuptools wheel
+      pip install --upgrade pip setuptools wheel
+      pip install setuptools==65.0.0
       pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
